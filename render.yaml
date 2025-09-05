@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: eon-pdf-service
+    env: docker
+    plan: starter   # consider 1 GB RAM (Starter Plus) for heavy PDFs
+    autoDeploy: true
+    healthCheckPath: /healthz
+    envVars:
+      - key: PDF_KEY
+        sync: false          # set in dashboard
+      - key: URL_ALLOWLIST
+        value: https://www.eonresume.co.za,https://eonresume.co.za,https://www.employmentecho.co.za,http://localhost:3000
+      - key: CORS_ORIGINS
+        value: https://www.eonresume.co.za,https://eonresume.co.za,http://localhost:3000
