@@ -75,7 +75,7 @@ app.post("/pdf", async (req, res) => {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    const { url, html, baseUrl, fileName, media } = req.body || {};
+    const { url, html, baseUrl, fileName, media, waitForSelector } = req.body || {};
     if (!url && !html) return res.status(400).json({ error: "Provide url or html" });
 
     if (url && !isAllowedUrl(url)) {
@@ -85,6 +85,9 @@ app.post("/pdf", async (req, res) => {
     const browser = await getBrowser();
     const page = await browser.newPage({ deviceScaleFactor: 2 });
 
+    if (waitForSelector) {
+        await page.waitForSelector(waitForSelector, { timeout: 10000 });
+    }
     // "screen" keeps the page looking exactly like the app.
     await page.emulateMedia({ media: media === "print" ? "print" : "screen" });
 
