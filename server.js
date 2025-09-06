@@ -5,13 +5,12 @@ import helmet from "helmet";
 import { chromium } from "playwright";
 
 const PORT = process.env.PORT || 3001;
-const PDF_KEY = process.env.PDF_KEY || ""; // required shared secret
+const PDF_KEY = process.env.PDF_KEY || "";
 const URL_ALLOWLIST = (process.env.URL_ALLOWLIST || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// Optional CORS: set allowed origins if you'll call this directly from the browser
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
@@ -22,10 +21,10 @@ app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(compression());
 app.use(express.json({ limit: "2mb" }));
 
-// Minimal CORS (server-to-server recommended; expose only if needed)
+// Strict CORS only if you really need browser calls; server-to-server is recommended.
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (origin && (CORS_ORIGINS.length === 0 || CORS_ORIGINS.includes(origin))) {
+  if (origin && CORS_ORIGINS.length && CORS_ORIGINS.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-PDF-Key");
@@ -35,7 +34,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// --- Playwright singleton (warm)
+// Playwright singleton (warm)
 let browserPromise = null;
 async function getBrowser() {
   if (!browserPromise) {
@@ -46,9 +45,8 @@ async function getBrowser() {
   }
   return browserPromise;
 }
-getBrowser().catch(console.error); // warm on boot
+getBrowser().catch(console.error);
 
-// Utils
 function sanitizeFileName(name = "resume.pdf") {
   let n = String(name).replace(/[^a-z0-9._-]+/gi, "_");
   if (!n.toLowerCase().endsWith(".pdf")) n += ".pdf";
@@ -56,17 +54,18 @@ function sanitizeFileName(name = "resume.pdf") {
 }
 function isAllowedUrl(url) {
   try {
-    const u = new URL(url);
+    // eslint-disable-next-line no-new
+    new URL(url);
     return URL_ALLOWLIST.some((prefix) => url.startsWith(prefix));
   } catch {
     return false;
   }
 }
 
-// Healthcheck
+// Health
 app.get("/healthz", (_, res) => res.send("ok"));
 
-// Main endpoint
+// Main
 app.post("/pdf", async (req, res) => {
   try {
     // Auth
@@ -83,10 +82,13 @@ app.post("/pdf", async (req, res) => {
       media,
       waitForSelector,
       extraHeaders,
+      debug,
+      delay,
     } = req.body || {};
-    if (!url && !html)
-      return res.status(400).json({ error: "Provide url or html" });
 
+    if (!url && !html) {
+      return res.status(400).json({ error: "Provide url or html" });
+    }
     if (url && !isAllowedUrl(url)) {
       return res.status(400).json({ error: "URL not allowed" });
     }
@@ -94,7 +96,7 @@ app.post("/pdf", async (req, res) => {
     const browser = await getBrowser();
     const page = await browser.newPage({ deviceScaleFactor: 2 });
 
-    // Allow dev-only extra headers and auto-bypass ngrok warning
+    // Forward headers to target (dev: skip ngrok warning)
     const hdrs = { ...(extraHeaders || {}) };
     if (url && /ngrok-(free\.app|io)/.test(url)) {
       hdrs["ngrok-skip-browser-warning"] =
@@ -104,32 +106,82 @@ app.post("/pdf", async (req, res) => {
       await page.setExtraHTTPHeaders(hdrs);
     }
 
-    if (waitForSelector) {
-      await page.waitForSelector(waitForSelector, { timeout: 200000 });
-    }
-    // "screen" keeps the page looking exactly like the app.
+    // Match on-screen styles by default
     await page.emulateMedia({ media: media === "print" ? "print" : "screen" });
 
+    // 1) Navigate or set content
     if (url) {
-      await page.goto(url, { waitUntil: "networkidle", timeout: 20000 });
+      await page.goto(url, { waitUntil: "load", timeout: 45000 });
     } else {
       const content = baseUrl
         ? String(html).replace(/<head>/i, `<head><base href="${baseUrl}">`)
         : String(html);
-      await page.setContent(content, { waitUntil: "load", timeout: 20000 });
+      await page.setContent(content, { waitUntil: "load", timeout: 45000 });
     }
 
-    // ensure web fonts are ready
+    // Optional early debug (what Playwright initially sees)
+    if (debug === "screenshot") {
+      const img = await page.screenshot({ fullPage: true });
+      await page.close();
+      res.type("image/png").send(img);
+      return;
+    }
+    if (debug === "html") {
+      const content = await page.content();
+      await page.close();
+      res.type("text/html").send(content);
+      return;
+    }
+
+    // 2) Robust readiness waits
+    const selector = waitForSelector || "#resume-root";
+
+    // a) wrapper present in DOM
+    await page.waitForSelector(selector, { state: "attached", timeout: 30000 });
+
+    // b) doc loaded + (best-effort) idle
+    await page.waitForLoadState("load");
+    await page.waitForLoadState("networkidle").catch(() => {});
+
+    // c) web fonts ready
     await page.evaluate(async () => {
-      /* @ts-ignore */
-      (await (document && document.fonts && document.fonts.ready)) || null;
+      if (document.fonts && document.fonts.ready) {
+        await document.fonts.ready;
+      }
     });
 
+    // d) images loaded
+    await page
+      .waitForFunction(
+        () =>
+          Array.from(document.images).every(
+            (img) => img.complete && img.naturalWidth > 0
+          ),
+        { timeout: 15000 }
+      )
+      .catch(() => {});
+
+    // e) container has real height (hydration complete)
+    await page.waitForFunction(
+      (sel) => {
+        const el = document.querySelector(sel);
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        return r.height > 200;
+      },
+      { timeout: 20000 },
+      selector
+    );
+
+    // f) small settle delay
+    await page.waitForTimeout(typeof delay === "number" ? delay : 300);
+
+    // 3) Print
     const pdfBuffer = await page.pdf({
       printBackground: true,
-      preferCSSPageSize: true, // use @page if you set it (A4, margins, etc.)
+      preferCSSPageSize: true,
       margin: { top: "10mm", right: "10mm", bottom: "10mm", left: "10mm" },
-      timeout: 20000,
+      timeout: 45000,
     });
 
     await page.close();
@@ -139,6 +191,7 @@ app.post("/pdf", async (req, res) => {
       "Content-Disposition",
       `attachment; filename="${sanitizeFileName(fileName || "resume.pdf")}"`
     );
+    res.setHeader("Cache-Control", "no-store");
     res.send(Buffer.from(pdfBuffer));
   } catch (e) {
     console.error("PDF error:", e);
