@@ -173,7 +173,7 @@ app.post("/pdf", async (req, res) => {
     );
 
     // f) settle
-    await page.waitForTimeout(typeof delay === "number" ? delay : 300);
+    await page.waitForTimeout(typeof delay === "number" ? delay : 3000);
     // -----------------------------------------------------------
 
     // Print
