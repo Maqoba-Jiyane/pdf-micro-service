@@ -62,6 +62,22 @@ function isAllowedUrl(url) {
   }
 }
 
+// Add this helper near the top (below other utils)
+function normalizeSelector(val, fallback = "#resume-root") {
+  if (typeof val === "string" && val.trim()) return val.trim();
+  if (Array.isArray(val)) {
+    const s = val.find(v => typeof v === "string" && v.trim());
+    if (s) return s.trim();
+  }
+  if (val && typeof val === "object") {
+    // accept common shapes like { selector: "#id" } or { value: ".class" }
+    if (typeof val.selector === "string" && val.selector.trim()) return val.selector.trim();
+    if (typeof val.value === "string" && val.value.trim()) return val.value.trim();
+  }
+  return fallback;
+}
+
+
 // Health
 app.get("/healthz", (_, res) => res.send("ok"));
 
@@ -119,6 +135,49 @@ app.post("/pdf", async (req, res) => {
       await page.setContent(content, { waitUntil: "load", timeout: 45000 });
     }
 
+    // … after page.goto(...) or page.setContent(...)
+
+// 2) Robust readiness waits
+const selector = normalizeSelector(waitForSelector, "#resume-root");
+
+// a) wrapper present in DOM
+await page.waitForSelector(selector, { state: "attached", timeout: 30000 });
+
+// b) doc loaded + (best-effort) idle
+await page.waitForLoadState("load");
+await page.waitForLoadState("networkidle").catch(() => {});
+
+// c) web fonts ready
+await page.evaluate(async () => {
+  if (document.fonts && document.fonts.ready) await document.fonts.ready;
+});
+
+// d) images loaded
+await page
+  .waitForFunction(
+    () => Array.from(document.images).every(img => img.complete && img.naturalWidth > 0),
+    { timeout: 15000 }
+  )
+  .catch(() => {});
+
+// e) container has real height (hydration complete)
+//    (Guard for non-string sel inside the page function)
+await page.waitForFunction(
+  sel => {
+    if (typeof sel !== "string") return false;
+    const el = document.querySelector(sel);
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    return r.height > 200;
+  },
+  { timeout: 20000 },
+  selector
+);
+
+// f) settle
+await page.waitForTimeout(typeof delay === "number" ? delay : 300);
+
+
     // Optional early debug (what Playwright initially sees)
     if (debug === "screenshot") {
       const img = await page.screenshot({ fullPage: true });
@@ -132,9 +191,6 @@ app.post("/pdf", async (req, res) => {
       res.type("text/html").send(content);
       return;
     }
-
-    // 2) Robust readiness waits
-    const selector = waitForSelector || "#resume-root";
 
     // a) wrapper present in DOM
     await page.waitForSelector(selector, { state: "attached", timeout: 30000 });
