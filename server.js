@@ -75,8 +75,17 @@ app.post("/pdf", async (req, res) => {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    const { url, html, baseUrl, fileName, media, waitForSelector } = req.body || {};
-    if (!url && !html) return res.status(400).json({ error: "Provide url or html" });
+    const {
+      url,
+      html,
+      baseUrl,
+      fileName,
+      media,
+      waitForSelector,
+      extraHeaders,
+    } = req.body || {};
+    if (!url && !html)
+      return res.status(400).json({ error: "Provide url or html" });
 
     if (url && !isAllowedUrl(url)) {
       return res.status(400).json({ error: "URL not allowed" });
@@ -85,8 +94,18 @@ app.post("/pdf", async (req, res) => {
     const browser = await getBrowser();
     const page = await browser.newPage({ deviceScaleFactor: 2 });
 
+    // Allow dev-only extra headers and auto-bypass ngrok warning
+    const hdrs = { ...(extraHeaders || {}) };
+    if (url && /ngrok-(free\.app|io)/.test(url)) {
+      hdrs["ngrok-skip-browser-warning"] =
+        hdrs["ngrok-skip-browser-warning"] || "1";
+    }
+    if (Object.keys(hdrs).length) {
+      await page.setExtraHTTPHeaders(hdrs);
+    }
+
     if (waitForSelector) {
-        await page.waitForSelector(waitForSelector, { timeout: 10000 });
+      await page.waitForSelector(waitForSelector, { timeout: 200000 });
     }
     // "screen" keeps the page looking exactly like the app.
     await page.emulateMedia({ media: media === "print" ? "print" : "screen" });
@@ -101,8 +120,9 @@ app.post("/pdf", async (req, res) => {
     }
 
     // ensure web fonts are ready
-    await page.evaluate(async () => { /* @ts-ignore */
-      await (document && document.fonts && document.fonts.ready) || null;
+    await page.evaluate(async () => {
+      /* @ts-ignore */
+      (await (document && document.fonts && document.fonts.ready)) || null;
     });
 
     const pdfBuffer = await page.pdf({
@@ -115,7 +135,10 @@ app.post("/pdf", async (req, res) => {
     await page.close();
 
     res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", `attachment; filename="${sanitizeFileName(fileName || "resume.pdf")}"`);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${sanitizeFileName(fileName || "resume.pdf")}"`
+    );
     res.send(Buffer.from(pdfBuffer));
   } catch (e) {
     console.error("PDF error:", e);
