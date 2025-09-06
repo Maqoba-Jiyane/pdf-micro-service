@@ -21,7 +21,6 @@ app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(compression());
 app.use(express.json({ limit: "2mb" }));
 
-// Strict CORS only if you really need browser calls; server-to-server is recommended.
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (origin && CORS_ORIGINS.length && CORS_ORIGINS.includes(origin)) {
@@ -34,7 +33,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Playwright singleton (warm)
+// Playwright singleton
 let browserPromise = null;
 async function getBrowser() {
   if (!browserPromise) {
@@ -47,6 +46,7 @@ async function getBrowser() {
 }
 getBrowser().catch(console.error);
 
+// Utils
 function sanitizeFileName(name = "resume.pdf") {
   let n = String(name).replace(/[^a-z0-9._-]+/gi, "_");
   if (!n.toLowerCase().endsWith(".pdf")) n += ".pdf";
@@ -54,29 +54,24 @@ function sanitizeFileName(name = "resume.pdf") {
 }
 function isAllowedUrl(url) {
   try {
-    // eslint-disable-next-line no-new
     new URL(url);
     return URL_ALLOWLIST.some((prefix) => url.startsWith(prefix));
   } catch {
     return false;
   }
 }
-
-// Add this helper near the top (below other utils)
 function normalizeSelector(val, fallback = "#resume-root") {
   if (typeof val === "string" && val.trim()) return val.trim();
   if (Array.isArray(val)) {
-    const s = val.find(v => typeof v === "string" && v.trim());
+    const s = val.find((v) => typeof v === "string" && v.trim());
     if (s) return s.trim();
   }
   if (val && typeof val === "object") {
-    // accept common shapes like { selector: "#id" } or { value: ".class" }
     if (typeof val.selector === "string" && val.selector.trim()) return val.selector.trim();
     if (typeof val.value === "string" && val.value.trim()) return val.value.trim();
   }
   return fallback;
 }
-
 
 // Health
 app.get("/healthz", (_, res) => res.send("ok"));
@@ -102,12 +97,8 @@ app.post("/pdf", async (req, res) => {
       delay,
     } = req.body || {};
 
-    if (!url && !html) {
-      return res.status(400).json({ error: "Provide url or html" });
-    }
-    if (url && !isAllowedUrl(url)) {
-      return res.status(400).json({ error: "URL not allowed" });
-    }
+    if (!url && !html) return res.status(400).json({ error: "Provide url or html" });
+    if (url && !isAllowedUrl(url)) return res.status(400).json({ error: "URL not allowed" });
 
     const browser = await getBrowser();
     const page = await browser.newPage({ deviceScaleFactor: 2 });
@@ -115,17 +106,14 @@ app.post("/pdf", async (req, res) => {
     // Forward headers to target (dev: skip ngrok warning)
     const hdrs = { ...(extraHeaders || {}) };
     if (url && /ngrok-(free\.app|io)/.test(url)) {
-      hdrs["ngrok-skip-browser-warning"] =
-        hdrs["ngrok-skip-browser-warning"] || "1";
+      hdrs["ngrok-skip-browser-warning"] = hdrs["ngrok-skip-browser-warning"] || "1";
     }
-    if (Object.keys(hdrs).length) {
-      await page.setExtraHTTPHeaders(hdrs);
-    }
+    if (Object.keys(hdrs).length) await page.setExtraHTTPHeaders(hdrs);
 
     // Match on-screen styles by default
     await page.emulateMedia({ media: media === "print" ? "print" : "screen" });
 
-    // 1) Navigate or set content
+    // Navigate or set content
     if (url) {
       await page.goto(url, { waitUntil: "load", timeout: 45000 });
     } else {
@@ -135,50 +123,7 @@ app.post("/pdf", async (req, res) => {
       await page.setContent(content, { waitUntil: "load", timeout: 45000 });
     }
 
-    // … after page.goto(...) or page.setContent(...)
-
-// 2) Robust readiness waits
-const selector = normalizeSelector(waitForSelector, "#resume-root");
-
-// a) wrapper present in DOM
-await page.waitForSelector(selector, { state: "attached", timeout: 30000 });
-
-// b) doc loaded + (best-effort) idle
-await page.waitForLoadState("load");
-await page.waitForLoadState("networkidle").catch(() => {});
-
-// c) web fonts ready
-await page.evaluate(async () => {
-  if (document.fonts && document.fonts.ready) await document.fonts.ready;
-});
-
-// d) images loaded
-await page
-  .waitForFunction(
-    () => Array.from(document.images).every(img => img.complete && img.naturalWidth > 0),
-    { timeout: 15000 }
-  )
-  .catch(() => {});
-
-// e) container has real height (hydration complete)
-//    (Guard for non-string sel inside the page function)
-await page.waitForFunction(
-  sel => {
-    if (typeof sel !== "string") return false;
-    const el = document.querySelector(sel);
-    if (!el) return false;
-    const r = el.getBoundingClientRect();
-    return r.height > 200;
-  },
-  { timeout: 20000 },
-  selector
-);
-
-// f) settle
-await page.waitForTimeout(typeof delay === "number" ? delay : 300);
-
-
-    // Optional early debug (what Playwright initially sees)
+    // Optional debug (pre-wait)
     if (debug === "screenshot") {
       const img = await page.screenshot({ fullPage: true });
       await page.close();
@@ -192,6 +137,9 @@ await page.waitForTimeout(typeof delay === "number" ? delay : 300);
       return;
     }
 
+    // ---------- Robust readiness waits (single block) ----------
+    const selector = normalizeSelector(waitForSelector, "#resume-root");
+
     // a) wrapper present in DOM
     await page.waitForSelector(selector, { state: "attached", timeout: 30000 });
 
@@ -201,38 +149,34 @@ await page.waitForTimeout(typeof delay === "number" ? delay : 300);
 
     // c) web fonts ready
     await page.evaluate(async () => {
-      if (document.fonts && document.fonts.ready) {
-        await document.fonts.ready;
-      }
+      if (document.fonts && document.fonts.ready) await document.fonts.ready;
     });
 
     // d) images loaded
     await page
       .waitForFunction(
-        () =>
-          Array.from(document.images).every(
-            (img) => img.complete && img.naturalWidth > 0
-          ),
+        () => Array.from(document.images).every((img) => img.complete && img.naturalWidth > 0),
         { timeout: 15000 }
       )
       .catch(() => {});
 
-    // e) container has real height (hydration complete)
+    // e) container has real height (guard for non-string)
     await page.waitForFunction(
       (sel) => {
+        if (typeof sel !== "string") return false;
         const el = document.querySelector(sel);
         if (!el) return false;
-        const r = el.getBoundingClientRect();
-        return r.height > 200;
+        return el.getBoundingClientRect().height > 200;
       },
       { timeout: 20000 },
       selector
     );
 
-    // f) small settle delay
+    // f) settle
     await page.waitForTimeout(typeof delay === "number" ? delay : 300);
+    // -----------------------------------------------------------
 
-    // 3) Print
+    // Print
     const pdfBuffer = await page.pdf({
       printBackground: true,
       preferCSSPageSize: true,
