@@ -5,7 +5,7 @@ import helmet from "helmet";
 import { chromium } from "playwright";
 
 const PORT = process.env.PORT || 3001;
-const PDF_KEY = process.env.PDF_KEY || "";
+const SERVICE_KEY = process.env.PDF_KEY || ""; // reuse the same secret
 const URL_ALLOWLIST = (process.env.URL_ALLOWLIST || "")
   .split(",")
   .map((s) => s.trim())
@@ -33,7 +33,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Playwright singleton
+// ---- Playwright singleton ----
 let browserPromise = null;
 async function getBrowser() {
   if (!browserPromise) {
@@ -46,12 +46,7 @@ async function getBrowser() {
 }
 getBrowser().catch(console.error);
 
-// Utils
-function sanitizeFileName(name = "resume.pdf") {
-  let n = String(name).replace(/[^a-z0-9._-]+/gi, "_");
-  if (!n.toLowerCase().endsWith(".pdf")) n += ".pdf";
-  return n.slice(0, 128);
-}
+// ---- utils ----
 function isAllowedUrl(url) {
   try {
     new URL(url);
@@ -60,7 +55,7 @@ function isAllowedUrl(url) {
     return false;
   }
 }
-function normalizeSelector(val, fallback = "#resume-root") {
+function normalizeSelector(val, fallback = null) {
   if (typeof val === "string" && val.trim()) return val.trim();
   if (Array.isArray(val)) {
     const s = val.find((v) => typeof v === "string" && v.trim());
@@ -70,42 +65,48 @@ function normalizeSelector(val, fallback = "#resume-root") {
     if (typeof val.selector === "string" && val.selector.trim()) return val.selector.trim();
     if (typeof val.value === "string" && val.value.trim()) return val.value.trim();
   }
-  return fallback;
+  return fallback; // null = no selector wait
 }
 
-// Health
+// ---- health ----
 app.get("/healthz", (_, res) => res.send("ok"));
 
-// Main
-app.post("/pdf", async (req, res) => {
+// ---- grab endpoint ----
+// Body:
+// {
+//   "url": "https://...",
+//   "mode": "html" | "screenshot",   // default "html"
+//   "media": "screen" | "print",     // default "screen"
+//   "waitForSelector": "#resume-root",
+//   "extraHeaders": { "ngrok-skip-browser-warning": "1" },
+//   "timeoutMs": 45000               // optional
+// }
+app.post("/grab", async (req, res) => {
   try {
     // Auth
     const key = req.headers["x-pdf-key"];
-    if (!PDF_KEY || key !== PDF_KEY) {
+    if (!SERVICE_KEY || key !== SERVICE_KEY) {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
     const {
       url,
-      html,
-      baseUrl,
-      fileName,
-      media,
+      mode = "html",
+      media = "screen",
       waitForSelector,
       extraHeaders,
-      debug,
-      delay,
+      timeoutMs = 45000,
     } = req.body || {};
 
-    if (!url && !html) return res.status(400).json({ error: "Provide url or html" });
-    if (url && !isAllowedUrl(url)) return res.status(400).json({ error: "URL not allowed" });
+    if (!url) return res.status(400).json({ error: "Provide url" });
+    if (!isAllowedUrl(url)) return res.status(400).json({ error: "URL not allowed" });
 
     const browser = await getBrowser();
     const page = await browser.newPage({ deviceScaleFactor: 2 });
 
     // Forward headers to target (dev: skip ngrok warning)
     const hdrs = { ...(extraHeaders || {}) };
-    if (url && /ngrok-(free\.app|io)/.test(url)) {
+    if (/ngrok-(free\.app|io)/.test(url)) {
       hdrs["ngrok-skip-browser-warning"] = hdrs["ngrok-skip-browser-warning"] || "1";
     }
     if (Object.keys(hdrs).length) await page.setExtraHTTPHeaders(hdrs);
@@ -113,90 +114,38 @@ app.post("/pdf", async (req, res) => {
     // Match on-screen styles by default
     await page.emulateMedia({ media: media === "print" ? "print" : "screen" });
 
-    // Navigate or set content
-    if (url) {
-      await page.goto(url, { waitUntil: "load", timeout: 45000 });
-    } else {
-      const content = baseUrl
-        ? String(html).replace(/<head>/i, `<head><base href="${baseUrl}">`)
-        : String(html);
-      await page.setContent(content, { waitUntil: "load", timeout: 45000 });
+    // Go to the page
+    await page.goto(url, { waitUntil: "load", timeout: timeoutMs });
+
+    // Optional waits
+    const selector = normalizeSelector(waitForSelector, null);
+    if (selector) {
+      // element present
+      await page.waitForSelector(selector, { state: "attached", timeout: 30000 });
+      // basic readiness (best-effort)
+      await page.waitForLoadState("networkidle").catch(() => {});
+      // fonts
+      await page.evaluate(async () => {
+        if (document.fonts && document.fonts.ready) await document.fonts.ready;
+      });
     }
 
-    // Optional debug (pre-wait)
-    if (debug === "screenshot") {
+    // Return
+    if (mode === "screenshot") {
       const img = await page.screenshot({ fullPage: true });
       await page.close();
       res.type("image/png").send(img);
       return;
     }
-    if (debug === "html") {
-      const content = await page.content();
-      await page.close();
-      res.type("text/html").send(content);
-      return;
-    }
 
-    // ---------- Robust readiness waits (single block) ----------
-    const selector = normalizeSelector(waitForSelector, "#resume-root");
-
-    // a) wrapper present in DOM
-    await page.waitForSelector(selector, { state: "attached", timeout: 30000 });
-
-    // b) doc loaded + (best-effort) idle
-    await page.waitForLoadState("load");
-    await page.waitForLoadState("networkidle").catch(() => {});
-
-    // c) web fonts ready
-    await page.evaluate(async () => {
-      if (document.fonts && document.fonts.ready) await document.fonts.ready;
-    });
-
-    // d) images loaded
-    await page
-      .waitForFunction(
-        () => Array.from(document.images).every((img) => img.complete && img.naturalWidth > 0),
-        { timeout: 15000 }
-      )
-      .catch(() => {});
-
-    // e) container has real height (guard for non-string)
-    await page.waitForFunction(
-      (sel) => {
-        if (typeof sel !== "string") return false;
-        const el = document.querySelector(sel);
-        if (!el) return false;
-        return el.getBoundingClientRect().height > 200;
-      },
-      { timeout: 20000 },
-      selector
-    );
-
-    // f) settle
-    await page.waitForTimeout(typeof delay === "number" ? delay : 3000);
-    // -----------------------------------------------------------
-
-    // Print
-    const pdfBuffer = await page.pdf({
-      printBackground: true,
-      preferCSSPageSize: true,
-      margin: { top: "10mm", right: "10mm", bottom: "10mm", left: "10mm" },
-      timeout: 45000,
-    });
-
+    // default: HTML
+    const html = await page.content();
     await page.close();
-
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${sanitizeFileName(fileName || "resume.pdf")}"`
-    );
-    res.setHeader("Cache-Control", "no-store");
-    res.send(Buffer.from(pdfBuffer));
+    res.type("text/html").send(html);
   } catch (e) {
-    console.error("PDF error:", e);
-    res.status(500).json({ error: "PDF failed" });
+    console.error("GRAB error:", e);
+    res.status(500).json({ error: "Grab failed" });
   }
 });
 
-app.listen(PORT, () => console.log(`PDF service on :${PORT}`));
+app.listen(PORT, () => console.log(`Grab service on :${PORT}`));
