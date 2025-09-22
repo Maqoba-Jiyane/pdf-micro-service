@@ -127,6 +127,42 @@ app.post("/pdf", async (req, res) => {
       // element in DOM
       await page.waitForSelector(selector, { state: "attached", timeout: 30000 });
     }
+
+    // Navigate / Set content
+    let navResponse = null;
+    if (targetUrl) {
+      navResponse = await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+      const status = navResponse?.status();
+      const finalUrl = page.url();
+
+      // Helpful early failures
+      if (!navResponse) {
+        return res.status(502).json({ error: "No response from target", targetUrl });
+      }
+      if (!navResponse.ok()) {
+        return res.status(502).json({
+          error: "Target returned non-OK status",
+          status,
+          finalUrl,
+          targetUrl
+        });
+      }
+
+      // If you expect to stay on the same origin/path, sanity-check here:
+      // if (!finalUrl.startsWith(new URL(targetUrl).origin)) ...
+    } else {
+      const content = baseUrl
+        ? String(html).replace(/<head>/i, `<head><base href="${baseUrl}">`)
+        : String(html);
+      await page.setContent(content, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+    }
+
+    page.on("console", msg => console.log("[page console]", msg.type(), msg.text()));
+    page.on("requestfailed", req => console.warn("[request failed]", req.url(), req.failure()?.errorText));
+    page.on("response", resp => {
+      if (!resp.ok()) console.warn("[bad response]", resp.status(), resp.url());
+    });
+
     // page mostly idle; ignore if SPA keeps sockets open
     await page.waitForLoadState("networkidle").catch(() => {});
     // web fonts ready
