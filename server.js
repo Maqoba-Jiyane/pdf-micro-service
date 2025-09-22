@@ -256,6 +256,7 @@ app.post("/pdf", async (req, res) => {
     const pdfBuffer = await page.pdf({
       printBackground: true,
       preferCSSPageSize: true,
+      margin: { top: "5mm", right: "5mm", bottom: "5mm", left: "5mm" },
       timeout: 60000
     });
 
